@@ -93,8 +93,12 @@ def process_data(df):
     # Outs
     df['outs'] = df['outs_when_up']
     
+    # Run Differential
+    # Clip run diff to [-6, 6] to keep categories manageable and avoid sparse tails
+    df['run_diff_cat'] = df['run_diff'].clip(lower=-6, upper=6).astype(int).astype(str)
+    
     # Select Columns for Model
-    features = ['inning_clipped', 'is_top', 'outs', 'base_state', 'run_diff']
+    features = ['inning_clipped', 'is_top', 'outs', 'base_state', 'run_diff_cat']
     target = 'home_won'
     
     # Drop rows with missing values in key columns
@@ -106,46 +110,6 @@ def train_model(df):
     """Trains a Logistic Regression model for smoothing."""
     print("Training model...")
     
-    # We want to predict Home Win Prob
-    # Features:
-    # - Run Diff (Numeric)
-    # - Inning (Categorical or Numeric? Treating as categorical allows non-linear effects per inning)
-    # - Outs (Categorical)
-    # - Base State (Categorical)
-    # - Is Top (Categorical)
-    
-    # To get "smoothed" probabilities that respect the game logic, Logistic Regression is good.
-    # However, interaction terms are crucial (e.g., RunDiff matters more in 9th than 1st).
-    # A simple Linear model might miss that. 
-    # Let's use a Pipeline with OneHotEncoder for categorical and standard scaler for numeric?
-    # Actually, let's treat Inning, Outs, BaseState, IsTop as one large categorical combo if possible,
-    # or just use them as separate categorical features.
-    
-    # Better approach for "Smoothing":
-    # Use Logistic Regression but with RunDiff as numeric.
-    # But RunDiff effect size depends on Inning.
-    # So we need interaction features: RunDiff * Inning.
-    
-    # Simplest robust way: 
-    # Train separate models per Inning? Or one model with interactions.
-    # Let's try one model with OneHotEncoding for state variables.
-    
-    X = df[['inning_clipped', 'is_top', 'outs', 'base_state', 'run_diff']]
-    y = df['home_won']
-    
-    # Preprocessor
-    categorical_features = ['inning_clipped', 'is_top', 'outs', 'base_state']
-    numeric_features = ['run_diff']
-    
-    # We need to allow the model to learn that RunDiff coefficient changes over time.
-    # Standard LogReg won't capture "RunDiff worth more in 9th".
-    # We can add interaction terms manually or use a tree-based model.
-    # Given the request for "smoothed probability", a calibrated Random Forest or Gradient Boosting is often better 
-    # but might be "jagged".
-    # Let's stick to Logistic Regression but add interaction features manually before passing to model.
-    # Actually, simpler: Train a separate Logistic Regression for each Inning.
-    # This guarantees the "time decay" of run value is captured perfectly.
-    
     models = {}
     # Train one model per inning (1-9, 10+)
     unique_innings = sorted(df['inning_clipped'].unique())
@@ -154,23 +118,25 @@ def train_model(df):
         print(f"  Training for Inning {inn}...")
         inning_data = df[df['inning_clipped'] == inn]
         
-        # Sub-features: Top/Bot, Outs, BaseState, RunDiff
-        X_sub = inning_data[['is_top', 'outs', 'base_state', 'run_diff']]
+        # Sub-features: Top/Bot, Outs, BaseState, RunDiff (Categorical)
+        X_sub = inning_data[['is_top', 'outs', 'base_state', 'run_diff_cat']]
         y_sub = inning_data['home_won']
         
         if len(y_sub) < 100:
             continue # Skip sparse innings if any
             
+        # All features are now categorical!
+        # This allows the model to learn the exact value of a Tie vs +1 vs -1 independently.
         preprocessor = ColumnTransformer(
             transformers=[
-                ('cat', OneHotEncoder(handle_unknown='ignore', drop='first'), ['is_top', 'outs', 'base_state']),
-                ('num', 'passthrough', ['run_diff'])
+                ('cat', OneHotEncoder(handle_unknown='ignore', drop=None), ['is_top', 'outs', 'base_state', 'run_diff_cat'])
             ]
         )
         
+        # Using a slightly stronger regularization (C=1.0 is default) to prevent overfitting on rare combos
         pipeline = Pipeline([
             ('preprocessor', preprocessor),
-            ('classifier', LogisticRegression(max_iter=1000, solver='lbfgs'))
+            ('classifier', LogisticRegression(max_iter=1000, solver='lbfgs', C=0.5))
         ])
         
         pipeline.fit(X_sub, y_sub)
@@ -187,7 +153,7 @@ def generate_probability_table(models):
     top_bot = [1, 0] # 1=Top, 0=Bot
     outs = [0, 1, 2]
     base_states = ['000', '100', '020', '003', '120', '103', '023', '123']
-    run_diffs = range(-6, 7) # -6 to +6 (covers most interesting tight situations)
+    run_diffs = range(-6, 7) # -6 to +6
     
     rows = []
     
@@ -208,18 +174,17 @@ def generate_probability_table(models):
                     }
                     
                     # Predict for each RunDiff
-                    # Construct a batch DataFrame for prediction to be faster
                     batch_data = []
                     for rd in run_diffs:
                         batch_data.append({
                             'is_top': tb,
                             'outs': o,
                             'base_state': b,
-                            'run_diff': rd
+                            'run_diff_cat': str(rd)
                         })
                     
                     batch_df = pd.DataFrame(batch_data)
-                    probs = model.predict_proba(batch_df)[:, 1] # Probability of Home Win (class 1)
+                    probs = model.predict_proba(batch_df)[:, 1] # Probability of Home Win
                     
                     # Add probabilities to row
                     for rd, prob in zip(run_diffs, probs):
@@ -281,7 +246,7 @@ def style_table(df):
             
         return f'background-color: rgb({r}, {g}, {b}); color: black'
 
-    return df.style.applymap(color_gradient, subset=numeric_cols).format("{:.1%}", subset=numeric_cols)
+    return df.style.map(color_gradient, subset=numeric_cols).format("{:.1%}", subset=numeric_cols)
 
 def main():
     # 1. Fetch
