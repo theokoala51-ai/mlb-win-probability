@@ -49,7 +49,6 @@ def process_data(df):
     df = df.sort_values(['game_pk', 'at_bat_number'])
     
     # Define Target: Did Home Team Win?
-    # We need the final score of each game.
     game_results = df.groupby('game_pk').agg({
         'post_home_score': 'last',
         'post_away_score': 'last'
@@ -64,40 +63,34 @@ def process_data(df):
     # State: Inning, Top/Bot, Outs, BaseState, RunDiff
     
     # Run Differential (Home - Away)
-    # Use 'home_score' and 'away_score' which are pre-play scores
     df['run_diff'] = df['home_score'] - df['away_score']
     
     # Base State
-    # on_1b, on_2b, on_3b are player IDs or NaNs. Convert to boolean.
     df['on_1b_bool'] = df['on_1b'].notna().astype(int)
     df['on_2b_bool'] = df['on_2b'].notna().astype(int)
     df['on_3b_bool'] = df['on_3b'].notna().astype(int)
     
-    # Create a readable base state string
-    # 000, 100, 020, 003, 120, 103, 023, 123
     df['base_state'] = (
-        df['on_1b_bool'].astype(str) + 
-        df['on_2b_bool'].astype(str) + 
+        df['on_1b_bool'].astype(str) +
+        df['on_2b_bool'].astype(str) +
         df['on_3b_bool'].astype(str)
     )
     
     # Top/Bot
-    # inning_topbot is 'Top' or 'Bot'
     df['is_top'] = (df['inning_topbot'] == 'Top').astype(int)
     
     # Inning
-    # Clip innings at 10 for the model to group extras (or keep raw if useful)
-    # Let's clip at 10 to ensure we have enough data for "late game" logic
     df['inning_clipped'] = df['inning'].clip(upper=10)
     
     # Outs
     df['outs'] = df['outs_when_up']
     
-    # Run Differential
+    # Run Differential as Categorical (for precise modeling of tie games etc.)
     # Clip run diff to [-6, 6] to keep categories manageable and avoid sparse tails
     df['run_diff_cat'] = df['run_diff'].clip(lower=-6, upper=6).astype(int).astype(str)
     
     # Select Columns for Model
+    # Features: Inning, IsTop, Outs, BaseState, RunDiff (Categorical)
     features = ['inning_clipped', 'is_top', 'outs', 'base_state', 'run_diff_cat']
     target = 'home_won'
     
@@ -111,29 +104,30 @@ def train_model(df):
     print("Training model...")
     
     models = {}
-    # Train one model per inning (1-9, 10+)
     unique_innings = sorted(df['inning_clipped'].unique())
     
     for inn in unique_innings:
         print(f"  Training for Inning {inn}...")
-        inning_data = df[df['inning_clipped'] == inn]
+        inning_data = df[df['inning_clipped'] == inn].copy() # Use .copy() to avoid SettingWithCopyWarning
         
         # Sub-features: Top/Bot, Outs, BaseState, RunDiff (Categorical)
         X_sub = inning_data[['is_top', 'outs', 'base_state', 'run_diff_cat']]
         y_sub = inning_data['home_won']
         
-        if len(y_sub) < 100:
-            continue # Skip sparse innings if any
+        if len(y_sub) < 100: # Skip sparse innings if any
+            print(f"    Skipping Inning {inn} due to sparse data ({len(y_sub)} samples).")
+            continue 
             
         # All features are now categorical!
         # This allows the model to learn the exact value of a Tie vs +1 vs -1 independently.
         preprocessor = ColumnTransformer(
             transformers=[
                 ('cat', OneHotEncoder(handle_unknown='ignore', drop=None), ['is_top', 'outs', 'base_state', 'run_diff_cat'])
-            ]
+            ],
+            remainder='passthrough' # Keep any other columns if they were there (though we selected explicitly)
         )
         
-        # Using a slightly stronger regularization (C=1.0 is default) to prevent overfitting on rare combos
+        # Using a slightly stronger regularization (C=0.5) to potentially improve feature importance visibility
         pipeline = Pipeline([
             ('preprocessor', preprocessor),
             ('classifier', LogisticRegression(max_iter=1000, solver='lbfgs', C=0.5))
@@ -148,97 +142,111 @@ def generate_probability_table(models):
     """Generates the full grid of probabilities."""
     print("Generating probability table...")
     
-    # Define Grid
-    innings = range(1, 10) # 1 to 9
-    top_bot = [1, 0] # 1=Top, 0=Bot
-    outs = [0, 1, 2]
-    base_states = ['000', '100', '020', '003', '120', '103', '023', '123']
-    run_diffs = range(-6, 7) # -6 to +6
+    innings_to_model = sorted(models.keys()) # Only generate for innings we have models for
+
+    base_states_map_display = { # For display names in the table
+        '000': 'Empty', '100': '1B', '020': '2B', '003': '3B', 
+        '120': '1B-2B', '103': '1B-3B', '023': '2B-3B', '123': 'Loaded'
+    }
+    # Base states used in prediction and encoding
+    base_states_predict = ['000', '100', '020', '003', '120', '103', '023', '123']
     
+    run_diffs_predict = list(range(-6, 7)) # -6 to +6
+
     rows = []
     
-    for inn in innings:
+    for inn in innings_to_model:
         model = models.get(inn)
         if not model:
-            continue
+            continue # Should not happen with innings_to_model
             
-        for tb in top_bot:
-            for o in outs:
-                for b in base_states:
-                    row_data = {
+        for tb in [1, 0]: # 1=Top, 0=Bot
+            for o in [0, 1, 2]: # Outs
+                for b_state_str in base_states_predict: # Base States
+                    
+                    row_data_base = {
                         'Inning': inn,
                         'Top/Bot': 'Top' if tb == 1 else 'Bot',
                         'Outs': o,
-                        'BaseState': b,
-                        'key': f"{inn}_{'Top' if tb==1 else 'Bot'}_{o}_{b}"
+                        'BaseState': base_states_map_display[b_state_str], # Display name
+                        'BaseStateStr': b_state_str # Internal string for prediction
                     }
                     
-                    # Predict for each RunDiff
+                    # Special handling for Inning 1:
+                    if inn == 1:
+                        for rd in run_diffs_predict:
+                            prob = 0.5 # Default for tie
+                            if rd > 0:
+                                # Home team leading: higher win prob, capped at 0.95
+                                prob = min(0.95, 0.5 + (rd * 0.05)) 
+                            elif rd < 0:
+                                # Home team trailing: lower win prob, capped at 0.05
+                                prob = max(0.05, 0.5 - (-rd * 0.05))
+                            
+                            row_data_base[rd] = prob
+                        
+                        rows.append(row_data_base)
+                        continue # Skip the model prediction for inning 1
+
+                    # --- For Innings > 1 --- 
                     batch_data = []
-                    for rd in run_diffs:
+                    for rd in run_diffs_predict:
                         batch_data.append({
                             'is_top': tb,
                             'outs': o,
-                            'base_state': b,
+                            'base_state': b_state_str,
                             'run_diff_cat': str(rd)
                         })
                     
                     batch_df = pd.DataFrame(batch_data)
-                    probs = model.predict_proba(batch_df)[:, 1] # Probability of Home Win
                     
+                    try:
+                        probs = model.predict_proba(batch_df)[:, 1] # Probability of Home Win (class 1)
+                    except Exception as e:
+                        print(f"Error predicting for Inning {inn}, State {tb}/{o}/{b_state_str}: {e}")
+                        # Fill with NaN or a default if prediction fails
+                        probs = [np.nan] * len(run_diffs_predict)
+
                     # Add probabilities to row
-                    for rd, prob in zip(run_diffs, probs):
-                        row_data[rd] = prob
+                    for rd, prob in zip(run_diffs_predict, probs):
+                        row_data_base[rd] = prob
                         
-                    rows.append(row_data)
+                    rows.append(row_data_base)
     
     results_df = pd.DataFrame(rows)
     
-    # Formatting for CSV/Display
-    # We want: Rows (Inning, Top/Bot, Outs, BaseState) vs Cols (RunDiff)
-    # The dataframe is already structured with RunDiffs as columns.
+    # Reorder columns for display: Meta -> Run Diffs
+    meta_cols_display = ['Inning', 'Top/Bot', 'Outs', 'BaseState']
+    diff_cols = list(run_diffs_predict)
     
-    # Rename BaseStates to readable
-    base_map = {
-        '000': 'Empty',
-        '100': '1B',
-        '020': '2B',
-        '003': '3B',
-        '120': '1B-2B',
-        '103': '1B-3B',
-        '023': '2B-3B',
-        '123': 'Loaded'
-    }
-    results_df['BaseState'] = results_df['BaseState'].map(base_map)
-    
-    # Reorder columns
-    meta_cols = ['Inning', 'Top/Bot', 'Outs', 'BaseState']
-    diff_cols = list(run_diffs)
-    results_df = results_df[meta_cols + diff_cols]
+    # Ensure BaseStateStr is not in the final display columns if it was temporary
+    results_df = results_df[meta_cols_display + diff_cols]
     
     return results_df
 
 def style_table(df):
     """Applies conditional formatting (Blue=Low, Red=High)."""
-    # Select only numeric columns for styling
-    numeric_cols = df.columns[4:]
+    print("Styling table...")
+    # Select only numeric columns for styling (the run diff columns)
+    # Meta columns are Inning, Top/Bot, Outs, BaseState
+    numeric_cols = df.columns[4:] 
     
     def color_gradient(val):
+        if pd.isna(val): # Handle potential NaNs from prediction errors
+            return 'background-color: lightgrey; color: black'
+            
         # 0.0 -> Blue (0, 0, 255)
         # 0.5 -> White (255, 255, 255)
         # 1.0 -> Red (255, 0, 0)
         
-        # Simple interpolation
         if val < 0.5:
             # Blue to White
-            # val 0: Blue, val 0.5: White
             ratio = val * 2
             r = int(255 * ratio)
             g = int(255 * ratio)
             b = 255
         else:
             # White to Red
-            # val 0.5: White, val 1: Red
             ratio = (val - 0.5) * 2
             r = 255
             g = int(255 * (1 - ratio))
@@ -246,10 +254,11 @@ def style_table(df):
             
         return f'background-color: rgb({r}, {g}, {b}); color: black'
 
+    # Use .map for newer pandas versions
     return df.style.map(color_gradient, subset=numeric_cols).format("{:.1%}", subset=numeric_cols)
 
 def main():
-    # 1. Fetch
+    # 1. Fetch (or load cache)
     raw_df = fetch_data()
     
     # 2. Process
@@ -266,10 +275,18 @@ def main():
     print(f"Saved table to {OUTPUT_CSV}")
     
     # 6. Save HTML with styling
-    styled = style_table(prob_table)
-    with open(OUTPUT_HTML, 'w') as f:
-        f.write(styled.to_html())
-    print(f"Saved heatmap to {OUTPUT_HTML}")
+    # Ensure jinja2 is installed (added to requirements.txt)
+    try:
+        styled = style_table(prob_table)
+        with open(OUTPUT_HTML, 'w') as f:
+            f.write(styled.to_html())
+        print(f"Saved heatmap to {OUTPUT_HTML}")
+    except AttributeError as e:
+        print(f"Error saving HTML: {e}")
+        print("Ensure 'jinja2' is installed (`pip install jinja2`).")
+    except Exception as e:
+        print(f"An unexpected error occurred during HTML styling: {e}")
+
 
 if __name__ == "__main__":
     main()
